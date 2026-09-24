@@ -1,2 +1,15 @@
 /Invoke-RemoteCheckDb.ps1
 /python_test.ipynb
+
+# Daily check-in execution logs
+wooltari-checkin-logs/
+
+# Scratch & debug captures
+live_*
+scratch_*
+*.png
+
+# Agent & IDE workspace files
+.agents/
+.understand-anything/
+skills-lock.json

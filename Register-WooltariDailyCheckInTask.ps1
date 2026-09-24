@@ -15,7 +15,8 @@ if (-not (Test-Path $scriptPath)) {
 
 $action = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
-    -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $scriptPath)
+    -Argument ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $scriptPath) `
+    -WorkingDirectory $PSScriptRoot
 
 $trigger = New-ScheduledTaskTrigger -Daily -At $At
 $settings = New-ScheduledTaskSettingsSet `
