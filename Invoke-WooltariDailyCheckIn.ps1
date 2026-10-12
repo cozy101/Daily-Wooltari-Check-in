@@ -773,19 +773,36 @@ function Open-LoginPageForAutomation {
         -TitlePatterns $WooltariTitlePattern.Login)
 }
 
-function Invoke-CachedLogin {
-    param(
-        [string]$ChromePath,
-        [System.Windows.Automation.AutomationElement]$Window
-    )
+function Find-LoginEmailField {
+    param([System.Windows.Automation.AutomationElement]$Window)
 
-    Write-CheckInLog 'Login state was not confirmed. Navigating the current window to the login page and trying the saved Chrome credentials flow.'
-    $Window = Navigate-WindowToUrl -Window $Window -Url $LoginUrl -TitlePatterns $WooltariTitlePattern.Login
+    $editCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
 
-    if (Wait-ForLoggedInState -Window $Window -TimeoutSeconds 3) {
-        Write-CheckInLog 'Login page already shows a signed-in account.'
-        return $true
+    $allEdits = $Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
+
+    # Return the topmost Edit control in the page content area (the email field).
+    $topmost = $null
+    $topmostY = [double]::MaxValue
+
+    for ($i = 0; $i -lt $allEdits.Count; $i++) {
+        $el = $allEdits.Item($i)
+        try {
+            if (-not (Test-PageContentElement -Window $Window -Element $el)) { continue }
+            $y = $el.Current.BoundingRectangle.Top
+            if ($y -lt $topmostY) {
+                $topmostY = $y
+                $topmost = $el
+            }
+        } catch { continue }
     }
+
+    return $topmost
+}
+
+function Find-LoginSubmitButton {
+    param([System.Windows.Automation.AutomationElement]$Window)
 
     $loginPatterns = @(
         $WooltariPattern.LoginButton,
@@ -794,30 +811,91 @@ function Invoke-CachedLogin {
         '^\s*Login\s*$',
         '^\s*Sign in\s*$'
     )
-    $buttonTypes = @(
-        [System.Windows.Automation.ControlType]::Button,
-        [System.Windows.Automation.ControlType]::Custom,
-        [System.Windows.Automation.ControlType]::Hyperlink
+
+    # The form submit button is a Button control type wider than 80px.
+    # The site header nav "로그인" link is a Hyperlink that is only ~40px wide;
+    # filtering by type and minimum width excludes it reliably.
+    $all = $Window.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition)
+
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $el = $all.Item($i)
+        try {
+            if ($el.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button) { continue }
+            if (-not $el.Current.IsEnabled) { continue }
+            $n = $el.Current.Name
+            if ([string]::IsNullOrWhiteSpace($n)) { continue }
+            $matched = $false
+            foreach ($pat in $loginPatterns) { if ($n -match $pat) { $matched = $true; break } }
+            if (-not $matched) { continue }
+            if (-not (Test-PageContentElement -Window $Window -Element $el)) { continue }
+            if ($el.Current.BoundingRectangle.Width -le 80) { continue }
+            return $el
+        } catch { continue }
+    }
+
+    return $null
+}
+
+function Invoke-CachedLogin {
+    param(
+        [string]$ChromePath,
+        [System.Windows.Automation.AutomationElement]$Window
     )
+
+    Write-CheckInLog 'Login state was not confirmed. Navigating to login page to use Chrome saved credentials.'
+    $Window = Navigate-WindowToUrl -Window $Window -Url $LoginUrl -TitlePatterns $WooltariTitlePattern.Login
+
+    if (Wait-ForLoggedInState -Window $Window -TimeoutSeconds 3) {
+        Write-CheckInLog 'Login page already shows a signed-in account.'
+        return $true
+    }
+
+    Focus-AutomationWindow -Window $Window
+
+    # Click the email input field to trigger Chrome's password manager autofill
+    # dropdown, then press Down+Enter to select the first saved credential.
+    $emailField = Find-LoginEmailField -Window $Window
+    if ($emailField) {
+        $eb = $emailField.Current.BoundingRectangle
+        Write-CheckInLog ('Found email input field at {0},{1}; clicking to trigger Chrome password autofill.' -f [int]$eb.Left, [int]$eb.Top)
+        Click-AutomationElement -Element $emailField
+        Start-Sleep -Milliseconds 800
+        # Open the autofill dropdown and select the first saved account.
+        [System.Windows.Forms.SendKeys]::SendWait('{DOWN}')
+        Start-Sleep -Milliseconds 500
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        # Wait for Chrome to fill in email and password fields.
+        Start-Sleep -Seconds 2
+    } else {
+        Write-CheckInLog 'Email input field not found in page content; will attempt submit directly.'
+    }
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         Close-WooltariPopups -Window $Window
 
-        $loginButton = Find-AutomationElementByText `
-            -Root $Window `
-            -Patterns $loginPatterns `
-            -RequireEnabled `
-            -ControlTypes $buttonTypes `
-            -PageContentOnly
+        $loginButton = Find-LoginSubmitButton -Window $Window
 
         if (-not $loginButton) {
-            Write-CheckInLog ('Login submit button was not found on attempt {0}.' -f $attempt)
-            Start-Sleep -Seconds 2
+            Write-CheckInLog ('Login submit button not found on attempt {0}.' -f $attempt)
+            if ($attempt -lt 3) {
+                # Re-trigger autofill on retry in case the dropdown closed.
+                $emailField = Find-LoginEmailField -Window $Window
+                if ($emailField) {
+                    Click-AutomationElement -Element $emailField
+                    Start-Sleep -Milliseconds 800
+                    [System.Windows.Forms.SendKeys]::SendWait('{DOWN}')
+                    Start-Sleep -Milliseconds 500
+                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                    Start-Sleep -Seconds 2
+                }
+            }
             continue
         }
 
         $bounds = $loginButton.Current.BoundingRectangle
-        Write-CheckInLog ('Clicking the login submit button. Attempt {0}. Button bounds: {1},{2},{3},{4}.' -f $attempt, [int]$bounds.Left, [int]$bounds.Top, [int]$bounds.Width, [int]$bounds.Height)
+        Write-CheckInLog ('Clicking login submit button. Attempt {0}. Bounds: {1},{2},{3},{4}.' -f $attempt, [int]$bounds.Left, [int]$bounds.Top, [int]$bounds.Width, [int]$bounds.Height)
         Click-AutomationElement -Element $loginButton
         Start-Sleep -Seconds 3
 
@@ -825,7 +903,7 @@ function Invoke-CachedLogin {
             return $true
         }
 
-        Write-CheckInLog ('Login was not confirmed after click attempt {0}.' -f $attempt)
+        Write-CheckInLog ('Login not confirmed after click attempt {0}.' -f $attempt)
     }
 
     return $false
